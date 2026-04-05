@@ -33,7 +33,7 @@ UIMode currentMode = MODE_HOME;
 UIMode lastRenderedMode = MODE_COUNT;
 
 // =====================================================
-// 颜色：白底 + 仪表盘卡片
+// 颜色
 // =====================================================
 #define COL_BG         TFT_WHITE
 #define COL_PANEL      0xE71C
@@ -65,8 +65,9 @@ unsigned long dizzyUntilMs = 0;
 unsigned long lastShakeTriggerMs = 0;
 const unsigned long SHAKE_TRIGGER_COOLDOWN = 1200;
 
-// 这个阈值可以按你模型情况微调
 const float SHAKE_TRIGGER_THRESHOLD = 0.18f;
+const float LR_TRIGGER_THRESHOLD = 0.25f;
+const float UD_TRIGGER_THRESHOLD = 0.25f;
 
 uint32_t stepCount = 0;
 unsigned long lastStepMs = 0;
@@ -94,21 +95,19 @@ int gestureHistory[24] = {
   49, 57, 60, 58, 62, 59, 64, 61
 };
 
-int headShakeOffset = 0;
-
 // =====================================================
-// 刷新控制：解决屏闪
+// 刷新控制
 // =====================================================
-bool uiDirty = true;         // 需要整页刷新
-bool faceDirty = true;       // 只需要刷新中间脸
-bool footerDirty = true;     // 底部文字变化
-bool homeCornerDirty = true; // HOME 四角卡内容变化
+bool uiDirty = true;
+bool faceDirty = true;
+bool footerDirty = true;
+bool homeCornerDirty = true;
 
 unsigned long lastUiMs = 0;
-const unsigned long UI_INTERVAL_MS = 140;   // 整页刷新更慢，减少闪烁
+const unsigned long UI_INTERVAL_MS = 140;
 
 unsigned long lastFaceAnimMs = 0;
-const unsigned long FACE_ANIM_INTERVAL_MS = 55; // 脸的局部动画更快
+const unsigned long FACE_ANIM_INTERVAL_MS = 90;
 
 // =====================================================
 // Edge Impulse 输入缓存
@@ -199,6 +198,26 @@ void triggerDizzy() {
   dizzyUntilMs = millis() + 1500;
   lastShakeTriggerMs = millis();
   faceDirty = true;
+}
+
+void switchToNextMode() {
+  currentMode = (UIMode)((currentMode + 1) % MODE_COUNT);
+  lastModeSwitchMs = millis();
+  uiDirty = true;
+  faceDirty = true;
+  footerDirty = true;
+  homeCornerDirty = true;
+  Serial.println(">>> MODE NEXT");
+}
+
+void switchToPrevMode() {
+  currentMode = (UIMode)((currentMode - 1 + MODE_COUNT) % MODE_COUNT);
+  lastModeSwitchMs = millis();
+  uiDirty = true;
+  faceDirty = true;
+  footerDirty = true;
+  homeCornerDirty = true;
+  Serial.println(">>> MODE PREV");
 }
 
 void fillRoundPanel(int x, int y, int w, int h, int r, uint16_t fill, uint16_t border) {
@@ -307,31 +326,6 @@ void sampleIMUToBuffer() {
 }
 
 // =====================================================
-// 手势处理
-// =====================================================
-void handleGesture(const String &label, float score) {
-  if (millis() - lastModeSwitchMs < MODE_SWITCH_COOLDOWN) return;
-  if (score < 0.45f) return;
-
-  if (label == "left-right") {
-    currentMode = (UIMode)((currentMode + 1) % MODE_COUNT);
-    lastModeSwitchMs = millis();
-    uiDirty = true;
-    faceDirty = true;
-    footerDirty = true;
-    homeCornerDirty = true;
-  }
-  else if (label == "up-down") {
-    currentMode = (UIMode)((currentMode - 1 + MODE_COUNT) % MODE_COUNT);
-    lastModeSwitchMs = millis();
-    uiDirty = true;
-    faceDirty = true;
-    footerDirty = true;
-    homeCornerDirty = true;
-  }
-}
-
-// =====================================================
 // 顶部/底部
 // =====================================================
 void drawHeader() {
@@ -372,18 +366,16 @@ void clearContentArea() {
 }
 
 // =====================================================
-// HOME 页面：静态部分
+// HOME 页面
 // =====================================================
 void drawHomeStatic() {
   clearContentArea();
 
-  // 四角 dashboard
   drawMiniCard(16, 46, 92, 52, "Light", COL_CYAN2);
   drawMiniCard(212, 46, 92, 52, "Score", COL_PINK2);
   drawMiniCard(16, 144, 92, 52, "Trend", COL_CYAN2);
   drawMiniCard(212, 144, 92, 52, "Motion", COL_GREEN2);
 
-  // 中间主卡
   fillRoundPanel(112, 52, 96, 144, 18, COL_FACE_BG, COL_ACCENT);
 
   tft.setTextColor(TFT_DARKGREY, COL_FACE_BG);
@@ -391,7 +383,6 @@ void drawHomeStatic() {
 }
 
 void drawHomeCornerWidgets() {
-  // 左上：光照
   tft.fillRect(22, 58, 80, 34, COL_PANEL);
   int latestLight = lightHistory[(lightIndex - 1 + LIGHT_HISTORY) % LIGHT_HISTORY];
   tft.setTextColor(COL_CYAN2, COL_PANEL);
@@ -399,7 +390,6 @@ void drawHomeCornerWidgets() {
   tft.setTextColor(COL_SUBTEXT, COL_PANEL);
   tft.drawCentreString(lightContext, 62, 86, 1);
 
-  // 右上：score
   tft.fillRect(218, 58, 80, 34, COL_PANEL);
   int scorePercent = (int)(lastGestureScore * 100.0f);
   tft.setTextColor(COL_PINK2, COL_PANEL);
@@ -407,27 +397,21 @@ void drawHomeCornerWidgets() {
   tft.setTextColor(COL_SUBTEXT, COL_PANEL);
   tft.drawCentreString(lastGesture.c_str(), 258, 86, 1);
 
-  // 左下：折线图
   tft.fillRect(18, 150, 88, 40, COL_PANEL);
   drawMiniLineChart(16, 144, 92, 52, gestureHistory, 24, 0, 100, COL_CYAN2);
 
-  // 右下：gauge
   tft.fillRoundRect(212, 144, 92, 52, 10, COL_PANEL);
   tft.drawRoundRect(212, 144, 92, 52, 10, COL_GREEN2);
   drawGauge(258, 173, 18, min(stepCount % 100, 100U) / 100.0f, COL_GREEN2, "step");
 }
 
 void drawHomeFaceOnly() {
-  // 只清中间脸区域
   tft.fillRect(120, 82, 80, 82, COL_FACE_BG);
 
   int cx = 160;
   int cy = 116;
 
-  // 不再让头左右摇
-  headShakeOffset = 0;
-
-  // 晕的时候画一点残影线，但脸位置不动
+  // 不再左右摇头，只显示晕眩表情
   if (dizzyActive && millis() < dizzyUntilMs) {
     for (int i = 0; i < 2; i++) {
       int lx = cx - 34 - i * 5;
@@ -437,35 +421,27 @@ void drawHomeFaceOnly() {
     }
   }
 
-  // 脸固定在中间
   tft.fillCircle(cx, cy, 28, COL_FACE);
   tft.drawCircle(cx, cy, 28, COL_FACE_EDGE);
   tft.drawCircle(cx, cy, 29, COL_FACE_EDGE);
 
-  // 眼睛
   if (dizzyActive && millis() < dizzyUntilMs) {
-    // 晕眩眼：同心圈
     for (int r = 2; r <= 7; r += 2) {
       tft.drawCircle(cx - 10, cy - 7, r, TFT_BLACK);
       tft.drawCircle(cx + 10, cy - 7, r, TFT_BLACK);
     }
-  } else {
-    // 正常眼
-    tft.fillCircle(cx - 10, cy - 7, 4, TFT_BLACK);
-    tft.fillCircle(cx + 10, cy - 7, 4, TFT_BLACK);
-  }
 
-  // 嘴
-  if (dizzyActive && millis() < dizzyUntilMs) {
     tft.drawFastHLine(cx - 14, cy + 12, 28, COL_RED2);
     tft.drawFastHLine(cx - 14, cy + 13, 28, COL_RED2);
     tft.drawFastHLine(cx - 14, cy + 14, 28, COL_RED2);
   } else {
+    tft.fillCircle(cx - 10, cy - 7, 4, TFT_BLACK);
+    tft.fillCircle(cx + 10, cy - 7, 4, TFT_BLACK);
+
     tft.drawFastHLine(cx - 12, cy + 12, 24, TFT_BLACK);
     tft.drawFastHLine(cx - 12, cy + 13, 24, TFT_BLACK);
   }
 
-  // 底部文字区
   tft.fillRect(124, 148, 72, 34, COL_FACE_BG);
   tft.setTextColor(COL_TEXT, COL_FACE_BG);
   tft.drawCentreString(lastGesture, 160, 150, 2);
@@ -597,7 +573,6 @@ void renderUI() {
     tft.fillScreen(COL_BG);
     lastRenderedMode = currentMode;
   } else {
-    // 同一页面整页刷新时，也只清内容区，避免顶底反复闪
     clearContentArea();
   }
 
@@ -667,16 +642,11 @@ void loop() {
     String oldContext = lightContext;
     updateLightContext(rawLight);
 
-    // 趋势图慢更新
     for (int i = 0; i < 23; i++) gestureHistory[i] = gestureHistory[i + 1];
     gestureHistory[23] = (int)(lastGestureScore * 100.0f);
 
-    if (currentMode == MODE_LIGHT) {
-      uiDirty = true;
-    }
-    if (currentMode == MODE_HOME) {
-      homeCornerDirty = true;
-    }
+    if (currentMode == MODE_LIGHT) uiDirty = true;
+    if (currentMode == MODE_HOME) homeCornerDirty = true;
     if (lightContext != oldContext) {
       footerDirty = true;
       if (currentMode == MODE_HOME) homeCornerDirty = true;
@@ -714,7 +684,10 @@ void loop() {
     if (res == EI_IMPULSE_OK) {
       float score = 0.0f;
       String label = predictLabel(result, score);
+
       float shakeScore = getLabelScore(result, "shake");
+      float lrScore = getLabelScore(result, "left-right");
+      float udScore = getLabelScore(result, "up-down");
 
       lastGesture = label;
       lastGestureScore = score;
@@ -735,6 +708,12 @@ void loop() {
       Serial.print("shakeScore: ");
       Serial.println(shakeScore, 3);
 
+      Serial.print("leftRightScore: ");
+      Serial.println(lrScore, 3);
+
+      Serial.print("upDownScore: ");
+      Serial.println(udScore, 3);
+
       for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
         Serial.print(result.classification[i].label);
         Serial.print(": ");
@@ -742,14 +721,20 @@ void loop() {
       }
       Serial.println("-----");
 
-      // 关键：shake 单独触发，不要求必须 top1
       if (shakeScore > SHAKE_TRIGGER_THRESHOLD &&
           millis() - lastShakeTriggerMs > SHAKE_TRIGGER_COOLDOWN) {
         triggerDizzy();
         Serial.println(">>> SHAKE TRIGGERED");
       }
 
-      handleGesture(label, score);
+      if (millis() - lastModeSwitchMs >= MODE_SWITCH_COOLDOWN) {
+        if (lrScore > LR_TRIGGER_THRESHOLD && lrScore > udScore) {
+          switchToNextMode();
+        }
+        else if (udScore > UD_TRIGGER_THRESHOLD && udScore > lrScore) {
+          switchToPrevMode();
+        }
+      }
     } else {
       Serial.print("run_classifier error: ");
       Serial.println((int)res);
@@ -761,7 +746,6 @@ void loop() {
     faceDirty = true;
   }
 
-  // 脸动画单独局部刷新：减少闪屏
   if (currentMode == MODE_HOME &&
       (dizzyActive || faceDirty) &&
       millis() - lastFaceAnimMs >= FACE_ANIM_INTERVAL_MS) {
@@ -770,13 +754,11 @@ void loop() {
     faceDirty = false;
   }
 
-  // 底部信息局部刷新
   if (footerDirty && millis() - lastUiMs >= UI_INTERVAL_MS) {
     drawFooter();
     footerDirty = false;
   }
 
-  // HOME 页四角局部刷新
   if (currentMode == MODE_HOME &&
       homeCornerDirty &&
       millis() - lastUiMs >= UI_INTERVAL_MS) {
@@ -784,7 +766,6 @@ void loop() {
     homeCornerDirty = false;
   }
 
-  // 其他需要整页刷新时，再做整页刷新
   if (millis() - lastUiMs >= UI_INTERVAL_MS) {
     lastUiMs = millis();
     if (uiDirty) {
