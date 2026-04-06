@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <math.h>
 #include <string.h>
-#include <Wire.h>   // FIX: 补上 Wire 头文件
+#include <Wire.h>
 #include <TFT_eSPI.h>
 #include "LIS3DHTR.h"
 #include <machine_learning_inferencing.h>
@@ -51,12 +51,12 @@ UIMode lastRenderedMode = MODE_COUNT;
 #define COL_FACE       0xFD20
 #define COL_FACE_EDGE  TFT_ORANGE
 #define COL_FACE_BG    0xFFF9
-#define COL_PANEL2     COL_LINE   // FIX: 补上缺失颜色定义
+#define COL_PANEL2     COL_LINE
 
 // =====================================================
 // 模型与触发参数
 // =====================================================
-const float SHAKE_TRIGGER_THRESHOLD = 0.30f;
+const float SHAKE_TRIGGER_THRESHOLD = 0.20f;
 const float LR_TRIGGER_THRESHOLD    = 0.35f;
 const float UD_TRIGGER_THRESHOLD    = 0.35f;
 const float GESTURE_DOMINANCE_GAP   = 0.10f;
@@ -103,6 +103,11 @@ int gestureHistory[24] = {
 };
 
 // =====================================================
+// shake 后处理增强
+// =====================================================
+float shakeAccum = 0.0f;
+
+// =====================================================
 // 局部刷新控制
 // =====================================================
 bool headerDirty = true;
@@ -139,8 +144,7 @@ static int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
 }
 
 // =====================================================
-// FIX: 补上声音条更新函数
-// 只更新数据，不直接整页重绘，保持你原本的局部刷新逻辑
+// 声音条更新
 // =====================================================
 void updateMockSoundBars() {
   for (int i = 0; i < 8; i++) {
@@ -149,6 +153,28 @@ void updateMockSoundBars() {
     if (soundBars[i] < 16) soundBars[i] = 16;
     if (soundBars[i] > 78) soundBars[i] = 78;
   }
+}
+
+// =====================================================
+// 标签辅助判断
+// 按常见命名都兼容一下，避免标签名不一致
+// =====================================================
+bool isShakeLabel(const String &label) {
+  return label == "shake";
+}
+
+bool isLeftRightLabel(const String &label) {
+  return label == "left-right" ||
+         label == "leftright" ||
+         label == "left_right" ||
+         label == "leftRight";
+}
+
+bool isUpDownLabel(const String &label) {
+  return label == "up-down" ||
+         label == "updown" ||
+         label == "up_down" ||
+         label == "upDown";
 }
 
 // =====================================================
@@ -428,7 +454,6 @@ void drawHomeStatic() {
 }
 
 void drawHomeCornerWidgets() {
-  // 左上
   tft.fillRect(22, 58, 80, 34, COL_PANEL);
   int latestLight = lightHistory[(lightIndex - 1 + LIGHT_HISTORY) % LIGHT_HISTORY];
   tft.setTextColor(COL_CYAN2, COL_PANEL);
@@ -436,7 +461,6 @@ void drawHomeCornerWidgets() {
   tft.setTextColor(COL_SUBTEXT, COL_PANEL);
   tft.drawCentreString(lightContext, 62, 86, 1);
 
-  // 右上
   tft.fillRect(218, 58, 80, 34, COL_PANEL);
   int scorePercent = (int)(lastGestureScore * 100.0f);
   tft.setTextColor(COL_PINK2, COL_PANEL);
@@ -444,11 +468,9 @@ void drawHomeCornerWidgets() {
   tft.setTextColor(COL_SUBTEXT, COL_PANEL);
   tft.drawCentreString(lastGesture.c_str(), 258, 86, 1);
 
-  // 左下
   tft.fillRect(18, 150, 88, 40, COL_PANEL);
   drawMiniLineChart(16, 144, 92, 52, gestureHistory, 24, 0, 100, COL_CYAN2);
 
-  // 右下
   tft.fillRoundRect(212, 144, 92, 52, 10, COL_PANEL);
   tft.drawRoundRect(212, 144, 92, 52, 10, COL_GREEN2);
   drawGauge(258, 173, 18, min(stepCount % 100, 100U) / 100.0f, COL_GREEN2, "step", COL_PANEL);
@@ -526,7 +548,6 @@ void drawSoundBarsOnly() {
   int barW = 22;
   int gap = 10;
 
-  // 只清柱状图区域
   tft.fillRect(30, 96, 250, 88, COL_PANEL);
 
   for (int i = 0; i < 8; i++) {
@@ -559,7 +580,6 @@ void drawLightStatic() {
 }
 
 void drawLightDynamicOnly() {
-  // 清数字和图表区域，不动整页
   tft.fillRect(24, 76, 260, 110, COL_PANEL);
 
   int latestLight = lightHistory[(lightIndex - 1 + LIGHT_HISTORY) % LIGHT_HISTORY];
@@ -613,14 +633,12 @@ void drawActivityStatic() {
 }
 
 void drawActivityDynamicOnly() {
-  // 左卡动态区
   tft.fillRect(22, 76, 124, 108, COL_PANEL);
 
   tft.setTextColor(COL_GREEN2, COL_PANEL);
   tft.drawCentreString(String(stepCount), 84, 92, 6);
   drawMiniLineChart(24, 132, 120, 52, stepHistory, 24, 0, 24, COL_GREEN2);
 
-  // 右卡动态区
   tft.fillRoundRect(176, 76, 120, 104, 12, COL_FACE_BG);
   tft.drawRoundRect(176, 76, 120, 104, 12, COL_GREEN2);
 
@@ -680,7 +698,6 @@ void setup() {
     lightHistory[i] = 0;
   }
 
-  // FIX: begin() 直接调用，不要 if (!lis)
   lis.begin(Wire1);
   lis.setOutputDataRate(LIS3DHTR_DATARATE_100HZ);
   lis.setFullScaleRange(LIS3DHTR_RANGE_2G);
@@ -750,6 +767,13 @@ void loop() {
       float lrScore    = getLabelScore(result, "left-right");
       float udScore    = getLabelScore(result, "up-down");
 
+      if (shakeScore > 0.18f) {
+        shakeAccum += shakeScore;
+        if (shakeAccum > 1.2f) shakeAccum = 1.2f;
+      } else {
+        shakeAccum *= 0.65f;
+      }
+
       lastGesture = label;
       lastGestureScore = score;
       footerDirty = true;
@@ -764,14 +788,14 @@ void loop() {
       Serial.print(" score=");
       Serial.println(score, 3);
 
-      Serial.print("shakeScore: ");
-      Serial.println(shakeScore, 3);
-
-      Serial.print("leftRightScore: ");
-      Serial.println(lrScore, 3);
-
-      Serial.print("upDownScore: ");
-      Serial.println(udScore, 3);
+      Serial.print("shake=");
+      Serial.print(shakeScore, 3);
+      Serial.print(" lr=");
+      Serial.print(lrScore, 3);
+      Serial.print(" ud=");
+      Serial.print(udScore, 3);
+      Serial.print(" accum=");
+      Serial.println(shakeAccum, 3);
 
       for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
         Serial.print(result.classification[i].label);
@@ -783,23 +807,30 @@ void loop() {
       bool canSwitch = millis() - lastModeSwitchMs >= MODE_SWITCH_COOLDOWN;
       bool canShake  = millis() - lastShakeTriggerMs >= SHAKE_TRIGGER_COOLDOWN;
 
+      // 1) shake 优先，且当 shake 证据明显时不允许翻页
+      bool shakeLikely = (shakeAccum > 0.55f || isShakeLabel(label));
+
       if (canShake &&
+          shakeAccum > 0.75f &&
           shakeScore > SHAKE_TRIGGER_THRESHOLD &&
-          shakeScore > lrScore + GESTURE_DOMINANCE_GAP &&
-          shakeScore > udScore + GESTURE_DOMINANCE_GAP) {
+          shakeScore > lrScore - 0.03f &&
+          shakeScore > udScore - 0.03f) {
         triggerDizzy();
+        shakeAccum = 0.0f;
         Serial.println(">>> SHAKE TRIGGERED");
       }
+      // 2) 只有 label 明确就是 left-right，才翻到下一页
       else if (canSwitch &&
-               lrScore > LR_TRIGGER_THRESHOLD &&
-               lrScore > udScore + GESTURE_DOMINANCE_GAP &&
-               lrScore > shakeScore + GESTURE_DOMINANCE_GAP) {
+               !shakeLikely &&
+               isLeftRightLabel(label) &&
+               score > LR_TRIGGER_THRESHOLD) {
         switchToNextMode();
       }
+      // 3) 只有 label 明确就是 up-down，才返回上一页
       else if (canSwitch &&
-               udScore > UD_TRIGGER_THRESHOLD &&
-               udScore > lrScore + GESTURE_DOMINANCE_GAP &&
-               udScore > shakeScore + GESTURE_DOMINANCE_GAP) {
+               !shakeLikely &&
+               isUpDownLabel(label) &&
+               score > UD_TRIGGER_THRESHOLD) {
         switchToPrevMode();
       }
     } else {
@@ -813,7 +844,6 @@ void loop() {
     if (currentMode == MODE_HOME) homeFaceDirty = true;
   }
 
-  // 主页脸部动画局部刷新
   if (currentMode == MODE_HOME &&
       homeFaceDirty &&
       millis() - lastFaceAnimMs >= FACE_ANIM_INTERVAL_MS) {
@@ -821,7 +851,6 @@ void loop() {
     drawHomeFaceOnly();
   }
 
-  // 统一低频刷新其他局部区域
   if (millis() - lastUiMs >= UI_INTERVAL_MS) {
     lastUiMs = millis();
 
