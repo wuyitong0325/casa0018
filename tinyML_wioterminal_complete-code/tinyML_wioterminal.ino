@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <math.h>
 #include <string.h>
+#include <Wire.h>   // FIX: 补上 Wire 头文件
 #include <TFT_eSPI.h>
 #include "LIS3DHTR.h"
 #include <machine_learning_inferencing.h>
@@ -37,7 +38,7 @@ UIMode lastRenderedMode = MODE_COUNT;
 // =====================================================
 #define COL_BG         TFT_WHITE
 #define COL_PANEL      0xE71C
-#define COL_PANEL2     0xD69A
+#define COL_PANEL_ALT  0xF79E
 #define COL_TEXT       TFT_BLACK
 #define COL_SUBTEXT    TFT_DARKGREY
 #define COL_ACCENT     0x051D
@@ -50,6 +51,21 @@ UIMode lastRenderedMode = MODE_COUNT;
 #define COL_FACE       0xFD20
 #define COL_FACE_EDGE  TFT_ORANGE
 #define COL_FACE_BG    0xFFF9
+#define COL_PANEL2     COL_LINE   // FIX: 补上缺失颜色定义
+
+// =====================================================
+// 模型与触发参数
+// =====================================================
+const float SHAKE_TRIGGER_THRESHOLD = 0.30f;
+const float LR_TRIGGER_THRESHOLD    = 0.35f;
+const float UD_TRIGGER_THRESHOLD    = 0.35f;
+const float GESTURE_DOMINANCE_GAP   = 0.10f;
+
+unsigned long lastModeSwitchMs = 0;
+const unsigned long MODE_SWITCH_COOLDOWN = 1200;
+
+unsigned long lastShakeTriggerMs = 0;
+const unsigned long SHAKE_TRIGGER_COOLDOWN = 1200;
 
 // =====================================================
 // 状态变量
@@ -57,17 +73,8 @@ UIMode lastRenderedMode = MODE_COUNT;
 String lastGesture = "idle";
 float lastGestureScore = 0.0f;
 
-unsigned long lastModeSwitchMs = 0;
-const unsigned long MODE_SWITCH_COOLDOWN = 1200;
-
 bool dizzyActive = false;
 unsigned long dizzyUntilMs = 0;
-unsigned long lastShakeTriggerMs = 0;
-const unsigned long SHAKE_TRIGGER_COOLDOWN = 1200;
-
-const float SHAKE_TRIGGER_THRESHOLD = 0.18f;
-const float LR_TRIGGER_THRESHOLD = 0.25f;
-const float UD_TRIGGER_THRESHOLD = 0.25f;
 
 uint32_t stepCount = 0;
 unsigned long lastStepMs = 0;
@@ -96,15 +103,22 @@ int gestureHistory[24] = {
 };
 
 // =====================================================
-// 刷新控制
+// 局部刷新控制
 // =====================================================
-bool uiDirty = true;
-bool faceDirty = true;
+bool headerDirty = true;
 bool footerDirty = true;
+bool homeStaticDirty = true;
 bool homeCornerDirty = true;
+bool homeFaceDirty = true;
+bool soundStaticDirty = true;
+bool soundBarsDirty = true;
+bool lightStaticDirty = true;
+bool lightGraphDirty = true;
+bool activityStaticDirty = true;
+bool activityDynamicDirty = true;
 
 unsigned long lastUiMs = 0;
-const unsigned long UI_INTERVAL_MS = 140;
+const unsigned long UI_INTERVAL_MS = 120;
 
 unsigned long lastFaceAnimMs = 0;
 const unsigned long FACE_ANIM_INTERVAL_MS = 90;
@@ -122,6 +136,19 @@ bool bufferReady = false;
 static int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
   memcpy(out_ptr, imuBuffer + offset, length * sizeof(float));
   return 0;
+}
+
+// =====================================================
+// FIX: 补上声音条更新函数
+// 只更新数据，不直接整页重绘，保持你原本的局部刷新逻辑
+// =====================================================
+void updateMockSoundBars() {
+  for (int i = 0; i < 8; i++) {
+    int delta = random(-10, 11);
+    soundBars[i] += delta;
+    if (soundBars[i] < 16) soundBars[i] = 16;
+    if (soundBars[i] > 78) soundBars[i] = 78;
+  }
 }
 
 // =====================================================
@@ -150,14 +177,12 @@ uint16_t accentColorForMode(UIMode m) {
 String predictLabel(const ei_impulse_result_t &result, float &scoreOut) {
   size_t bestIx = 0;
   float bestVal = result.classification[0].value;
-
   for (size_t i = 1; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
     if (result.classification[i].value > bestVal) {
       bestVal = result.classification[i].value;
       bestIx = i;
     }
   }
-
   scoreOut = bestVal;
   return String(result.classification[bestIx].label);
 }
@@ -188,8 +213,8 @@ void maybeCountStep(float ax, float ay, float az) {
     stepCount++;
     lastStepMs = millis();
     footerDirty = true;
-    if (currentMode == MODE_ACTIVITY) uiDirty = true;
     if (currentMode == MODE_HOME) homeCornerDirty = true;
+    if (currentMode == MODE_ACTIVITY) activityDynamicDirty = true;
   }
 }
 
@@ -197,26 +222,42 @@ void triggerDizzy() {
   dizzyActive = true;
   dizzyUntilMs = millis() + 1500;
   lastShakeTriggerMs = millis();
-  faceDirty = true;
+  if (currentMode == MODE_HOME) homeFaceDirty = true;
+}
+
+void markAllDirtyForMode(UIMode m) {
+  headerDirty = true;
+  footerDirty = true;
+
+  if (m == MODE_HOME) {
+    homeStaticDirty = true;
+    homeCornerDirty = true;
+    homeFaceDirty = true;
+  } else if (m == MODE_SOUND) {
+    soundStaticDirty = true;
+    soundBarsDirty = true;
+  } else if (m == MODE_LIGHT) {
+    lightStaticDirty = true;
+    lightGraphDirty = true;
+  } else if (m == MODE_ACTIVITY) {
+    activityStaticDirty = true;
+    activityDynamicDirty = true;
+  }
 }
 
 void switchToNextMode() {
   currentMode = (UIMode)((currentMode + 1) % MODE_COUNT);
   lastModeSwitchMs = millis();
-  uiDirty = true;
-  faceDirty = true;
-  footerDirty = true;
-  homeCornerDirty = true;
+  lastRenderedMode = MODE_COUNT;
+  markAllDirtyForMode(currentMode);
   Serial.println(">>> MODE NEXT");
 }
 
 void switchToPrevMode() {
   currentMode = (UIMode)((currentMode - 1 + MODE_COUNT) % MODE_COUNT);
   lastModeSwitchMs = millis();
-  uiDirty = true;
-  faceDirty = true;
-  footerDirty = true;
-  homeCornerDirty = true;
+  lastRenderedMode = MODE_COUNT;
+  markAllDirtyForMode(currentMode);
   Serial.println(">>> MODE PREV");
 }
 
@@ -258,7 +299,7 @@ void drawMiniLineChart(int x, int y, int w, int h, int *data, int len, int minV,
   }
 }
 
-void drawGauge(int cx, int cy, int r, float value01, uint16_t arcColor, const char* label) {
+void drawGauge(int cx, int cy, int r, float value01, uint16_t arcColor, const char* label, uint16_t bg) {
   value01 = constrain(value01, 0.0f, 1.0f);
 
   for (int a = -140; a <= 140; a += 4) {
@@ -288,12 +329,12 @@ void drawGauge(int cx, int cy, int r, float value01, uint16_t arcColor, const ch
   tft.drawLine(cx + 1, cy, nx + 1, ny, arcColor);
   tft.fillCircle(cx, cy, 3, arcColor);
 
-  tft.setTextColor(COL_TEXT, COL_PANEL);
+  tft.setTextColor(COL_TEXT, bg);
   tft.drawCentreString(label, cx, cy + 8, 2);
 }
 
 // =====================================================
-// 采样 IMU
+// IMU 采样
 // =====================================================
 void sampleIMUToBuffer() {
   static unsigned long lastSampleMs = 0;
@@ -326,13 +367,12 @@ void sampleIMUToBuffer() {
 }
 
 // =====================================================
-// 顶部/底部
+// 头部 / 底部
 // =====================================================
 void drawHeader() {
   uint16_t accent = accentColorForMode(currentMode);
-
-  tft.fillRoundRect(10, 8, 300, 28, 10, 0xF79E);
-  tft.drawRoundRect(10, 8, 300, 28, 10, 0xD69A);
+  tft.fillRoundRect(10, 8, 300, 28, 10, COL_PANEL_ALT);
+  tft.drawRoundRect(10, 8, 300, 28, 10, COL_PANEL2);
 
   unsigned long sec = millis() / 1000;
   int mm = (sec / 60) % 60;
@@ -340,36 +380,39 @@ void drawHeader() {
   char timeBuf[16];
   snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", mm, ss);
 
-  tft.setTextColor(TFT_DARKGREY, 0xF79E);
+  tft.setTextColor(TFT_DARKGREY, COL_PANEL_ALT);
   tft.drawString(timeBuf, 20, 14, 2);
 
-  tft.setTextColor(accent, 0xF79E);
+  tft.setTextColor(accent, COL_PANEL_ALT);
   tft.drawCentreString(modeName(currentMode), 160, 14, 2);
 
-  tft.setTextColor(TFT_DARKGREY, 0xF79E);
+  tft.setTextColor(TFT_DARKGREY, COL_PANEL_ALT);
   tft.drawRightString(String(mockTempC) + "C", 295, 14, 2);
+
+  headerDirty = false;
 }
 
 void drawFooter() {
-  tft.fillRoundRect(10, 206, 300, 24, 10, 0xF79E);
-  tft.drawRoundRect(10, 206, 300, 24, 10, 0xD69A);
+  tft.fillRoundRect(10, 206, 300, 24, 10, COL_PANEL_ALT);
+  tft.drawRoundRect(10, 206, 300, 24, 10, COL_PANEL2);
 
-  tft.setTextColor(TFT_DARKGREY, 0xF79E);
+  tft.setTextColor(TFT_DARKGREY, COL_PANEL_ALT);
   tft.drawString("Steps " + String(stepCount), 20, 212, 2);
 
-  tft.setTextColor(accentColorForMode(currentMode), 0xF79E);
+  tft.setTextColor(accentColorForMode(currentMode), COL_PANEL_ALT);
   tft.drawRightString(lastGesture + " " + String(lastGestureScore, 2), 295, 212, 2);
-}
 
-void clearContentArea() {
-  tft.fillRect(0, 40, SCREEN_W, 162, COL_BG);
+  footerDirty = false;
 }
 
 // =====================================================
 // HOME 页面
 // =====================================================
 void drawHomeStatic() {
-  clearContentArea();
+  if (lastRenderedMode != MODE_HOME) {
+    tft.fillScreen(COL_BG);
+    lastRenderedMode = MODE_HOME;
+  }
 
   drawMiniCard(16, 46, 92, 52, "Light", COL_CYAN2);
   drawMiniCard(212, 46, 92, 52, "Score", COL_PINK2);
@@ -380,9 +423,12 @@ void drawHomeStatic() {
 
   tft.setTextColor(TFT_DARKGREY, COL_FACE_BG);
   tft.drawCentreString("Gesture", 160, 60, 2);
+
+  homeStaticDirty = false;
 }
 
 void drawHomeCornerWidgets() {
+  // 左上
   tft.fillRect(22, 58, 80, 34, COL_PANEL);
   int latestLight = lightHistory[(lightIndex - 1 + LIGHT_HISTORY) % LIGHT_HISTORY];
   tft.setTextColor(COL_CYAN2, COL_PANEL);
@@ -390,6 +436,7 @@ void drawHomeCornerWidgets() {
   tft.setTextColor(COL_SUBTEXT, COL_PANEL);
   tft.drawCentreString(lightContext, 62, 86, 1);
 
+  // 右上
   tft.fillRect(218, 58, 80, 34, COL_PANEL);
   int scorePercent = (int)(lastGestureScore * 100.0f);
   tft.setTextColor(COL_PINK2, COL_PANEL);
@@ -397,12 +444,16 @@ void drawHomeCornerWidgets() {
   tft.setTextColor(COL_SUBTEXT, COL_PANEL);
   tft.drawCentreString(lastGesture.c_str(), 258, 86, 1);
 
+  // 左下
   tft.fillRect(18, 150, 88, 40, COL_PANEL);
   drawMiniLineChart(16, 144, 92, 52, gestureHistory, 24, 0, 100, COL_CYAN2);
 
+  // 右下
   tft.fillRoundRect(212, 144, 92, 52, 10, COL_PANEL);
   tft.drawRoundRect(212, 144, 92, 52, 10, COL_GREEN2);
-  drawGauge(258, 173, 18, min(stepCount % 100, 100U) / 100.0f, COL_GREEN2, "step");
+  drawGauge(258, 173, 18, min(stepCount % 100, 100U) / 100.0f, COL_GREEN2, "step", COL_PANEL);
+
+  homeCornerDirty = false;
 }
 
 void drawHomeFaceOnly() {
@@ -411,7 +462,6 @@ void drawHomeFaceOnly() {
   int cx = 160;
   int cy = 116;
 
-  // 不再左右摇头，只显示晕眩表情
   if (dizzyActive && millis() < dizzyUntilMs) {
     for (int i = 0; i < 2; i++) {
       int lx = cx - 34 - i * 5;
@@ -437,7 +487,6 @@ void drawHomeFaceOnly() {
   } else {
     tft.fillCircle(cx - 10, cy - 7, 4, TFT_BLACK);
     tft.fillCircle(cx + 10, cy - 7, 4, TFT_BLACK);
-
     tft.drawFastHLine(cx - 12, cy + 12, 24, TFT_BLACK);
     tft.drawFastHLine(cx - 12, cy + 13, 24, TFT_BLACK);
   }
@@ -447,24 +496,71 @@ void drawHomeFaceOnly() {
   tft.drawCentreString(lastGesture, 160, 150, 2);
   tft.setTextColor(COL_ACCENT, COL_FACE_BG);
   tft.drawCentreString(String(lastGestureScore, 2), 160, 170, 2);
+
+  homeFaceDirty = false;
 }
 
-void drawHomeScreen() {
-  drawHomeStatic();
-  drawHomeCornerWidgets();
-  drawHomeFaceOnly();
+// =====================================================
+// SOUND 页面
+// =====================================================
+void drawSoundStatic() {
+  if (lastRenderedMode != MODE_SOUND) {
+    tft.fillScreen(COL_BG);
+    lastRenderedMode = MODE_SOUND;
+  }
+
+  fillRoundPanel(16, 46, 288, 150, 18, COL_PANEL, COL_PINK2);
+  tft.setTextColor(COL_SUBTEXT, COL_PANEL);
+  tft.drawString("Sound Dashboard", 28, 56, 2);
+  tft.setTextColor(COL_PINK2, COL_PANEL);
+  tft.drawString("AUDIO", 220, 56, 2);
+  tft.setTextColor(COL_TEXT, COL_PANEL);
+  tft.drawString("Energy", 28, 86, 4);
+
+  soundStaticDirty = false;
+}
+
+void drawSoundBarsOnly() {
+  int baseY = 178;
+  int startX = 36;
+  int barW = 22;
+  int gap = 10;
+
+  // 只清柱状图区域
+  tft.fillRect(30, 96, 250, 88, COL_PANEL);
+
+  for (int i = 0; i < 8; i++) {
+    int h = soundBars[i];
+    int x = startX + i * (barW + gap);
+    int y = baseY - h;
+
+    tft.fillRoundRect(x, y, barW, h, 6, COL_PINK2);
+    tft.drawRoundRect(x, y, barW, h, 6, COL_PINK2);
+    tft.drawFastVLine(x + 4, y + 4, max(0, h - 8), TFT_WHITE);
+  }
+
+  soundBarsDirty = false;
 }
 
 // =====================================================
 // LIGHT 页面
 // =====================================================
-void drawLightScreen() {
-  clearContentArea();
+void drawLightStatic() {
+  if (lastRenderedMode != MODE_LIGHT) {
+    tft.fillScreen(COL_BG);
+    lastRenderedMode = MODE_LIGHT;
+  }
 
   fillRoundPanel(16, 46, 288, 150, 18, COL_PANEL, COL_CYAN2);
-
   tft.setTextColor(COL_SUBTEXT, COL_PANEL);
   tft.drawString("Ambient Light", 28, 56, 2);
+
+  lightStaticDirty = false;
+}
+
+void drawLightDynamicOnly() {
+  // 清数字和图表区域，不动整页
+  tft.fillRect(24, 76, 260, 110, COL_PANEL);
 
   int latestLight = lightHistory[(lightIndex - 1 + LIGHT_HISTORY) % LIGHT_HISTORY];
   tft.setTextColor(COL_CYAN2, COL_PANEL);
@@ -493,55 +589,18 @@ void drawLightScreen() {
     tft.drawLine(x0, y0, x1, y1, COL_CYAN2);
     tft.drawLine(x0, y0 + 1, x1, y1 + 1, COL_CYAN2);
   }
-}
 
-// =====================================================
-// SOUND 页面
-// =====================================================
-void updateMockSoundBars() {
-  for (int i = 0; i < 8; i++) {
-    int delta = random(-7, 8);
-    soundBars[i] += delta;
-    if (soundBars[i] < 12) soundBars[i] = 12;
-    if (soundBars[i] > 76) soundBars[i] = 76;
-  }
-}
-
-void drawSoundScreen() {
-  clearContentArea();
-
-  fillRoundPanel(16, 46, 288, 150, 18, COL_PANEL, COL_PINK2);
-
-  tft.setTextColor(COL_SUBTEXT, COL_PANEL);
-  tft.drawString("Sound Dashboard", 28, 56, 2);
-
-  tft.setTextColor(COL_PINK2, COL_PANEL);
-  tft.drawString("AUDIO", 220, 56, 2);
-
-  int baseY = 178;
-  int startX = 36;
-  int barW = 22;
-  int gap = 10;
-
-  for (int i = 0; i < 8; i++) {
-    int h = soundBars[i];
-    int x = startX + i * (barW + gap);
-    int y = baseY - h;
-
-    tft.fillRoundRect(x, y, barW, h, 6, COL_PINK2);
-    tft.drawRoundRect(x, y, barW, h, 6, COL_PINK2);
-    tft.drawFastVLine(x + 4, y + 4, max(0, h - 8), TFT_WHITE);
-  }
-
-  tft.setTextColor(COL_TEXT, COL_PANEL);
-  tft.drawString("Energy", 28, 86, 4);
+  lightGraphDirty = false;
 }
 
 // =====================================================
 // STEP 页面
 // =====================================================
-void drawActivityScreen() {
-  clearContentArea();
+void drawActivityStatic() {
+  if (lastRenderedMode != MODE_ACTIVITY) {
+    tft.fillScreen(COL_BG);
+    lastRenderedMode = MODE_ACTIVITY;
+  }
 
   fillRoundPanel(16, 46, 136, 150, 18, COL_PANEL, COL_GREEN2);
   fillRoundPanel(168, 46, 136, 150, 18, COL_PANEL, COL_GREEN2);
@@ -550,41 +609,50 @@ void drawActivityScreen() {
   tft.drawString("Steps", 28, 56, 2);
   tft.drawString("Gauge", 180, 56, 2);
 
+  activityStaticDirty = false;
+}
+
+void drawActivityDynamicOnly() {
+  // 左卡动态区
+  tft.fillRect(22, 76, 124, 108, COL_PANEL);
+
   tft.setTextColor(COL_GREEN2, COL_PANEL);
   tft.drawCentreString(String(stepCount), 84, 92, 6);
-
   drawMiniLineChart(24, 132, 120, 52, stepHistory, 24, 0, 24, COL_GREEN2);
 
+  // 右卡动态区
   tft.fillRoundRect(176, 76, 120, 104, 12, COL_FACE_BG);
   tft.drawRoundRect(176, 76, 120, 104, 12, COL_GREEN2);
 
   float ratio = min(stepCount % 100, 100U) / 100.0f;
-  drawGauge(236, 124, 34, ratio, COL_GREEN2, "walk");
+  drawGauge(236, 124, 34, ratio, COL_GREEN2, "walk", COL_FACE_BG);
 
   tft.setTextColor(COL_GREEN2, COL_FACE_BG);
   tft.drawCentreString(String((int)(ratio * 100)), 236, 156, 2);
+
+  activityDynamicDirty = false;
 }
 
 // =====================================================
-// 总渲染
+// 页面渲染入口
 // =====================================================
-void renderUI() {
-  if (currentMode != lastRenderedMode) {
-    tft.fillScreen(COL_BG);
-    lastRenderedMode = currentMode;
-  } else {
-    clearContentArea();
+void renderCurrentModeIfNeeded() {
+  if (currentMode == MODE_HOME) {
+    if (homeStaticDirty) drawHomeStatic();
+    if (homeCornerDirty) drawHomeCornerWidgets();
+    if (homeFaceDirty) drawHomeFaceOnly();
   }
-
-  drawHeader();
-  drawFooter();
-
-  switch (currentMode) {
-    case MODE_HOME:     drawHomeScreen(); break;
-    case MODE_SOUND:    drawSoundScreen(); break;
-    case MODE_LIGHT:    drawLightScreen(); break;
-    case MODE_ACTIVITY: drawActivityScreen(); break;
-    default: break;
+  else if (currentMode == MODE_SOUND) {
+    if (soundStaticDirty) drawSoundStatic();
+    if (soundBarsDirty) drawSoundBarsOnly();
+  }
+  else if (currentMode == MODE_LIGHT) {
+    if (lightStaticDirty) drawLightStatic();
+    if (lightGraphDirty) drawLightDynamicOnly();
+  }
+  else if (currentMode == MODE_ACTIVITY) {
+    if (activityStaticDirty) drawActivityStatic();
+    if (activityDynamicDirty) drawActivityDynamicOnly();
   }
 }
 
@@ -612,20 +680,16 @@ void setup() {
     lightHistory[i] = 0;
   }
 
+  // FIX: begin() 直接调用，不要 if (!lis)
   lis.begin(Wire1);
-  if (!lis) {
-    Serial.println("LIS3DHTR init failed");
-    tft.fillScreen(TFT_RED);
-    tft.setTextColor(TFT_WHITE, TFT_RED);
-    tft.drawString("LIS3DHTR init failed", 20, 20, 2);
-    while (1);
-  }
-
   lis.setOutputDataRate(LIS3DHTR_DATARATE_100HZ);
   lis.setFullScaleRange(LIS3DHTR_RANGE_2G);
   Serial.println("imu ok");
 
-  renderUI();
+  markAllDirtyForMode(currentMode);
+  drawHeader();
+  drawFooter();
+  renderCurrentModeIfNeeded();
   Serial.println("setup done");
 }
 
@@ -645,19 +709,16 @@ void loop() {
     for (int i = 0; i < 23; i++) gestureHistory[i] = gestureHistory[i + 1];
     gestureHistory[23] = (int)(lastGestureScore * 100.0f);
 
-    if (currentMode == MODE_LIGHT) uiDirty = true;
     if (currentMode == MODE_HOME) homeCornerDirty = true;
-    if (lightContext != oldContext) {
-      footerDirty = true;
-      if (currentMode == MODE_HOME) homeCornerDirty = true;
-    }
+    if (currentMode == MODE_LIGHT) lightGraphDirty = true;
+    if (lightContext != oldContext) footerDirty = true;
   }
 
   static unsigned long lastSoundAnimMs = 0;
   if (millis() - lastSoundAnimMs >= 220) {
     lastSoundAnimMs = millis();
     updateMockSoundBars();
-    if (currentMode == MODE_SOUND) uiDirty = true;
+    if (currentMode == MODE_SOUND) soundBarsDirty = true;
   }
 
   static unsigned long lastStepHistMs = 0;
@@ -667,8 +728,8 @@ void loop() {
     for (int i = 0; i < 23; i++) stepHistory[i] = stepHistory[i + 1];
     stepHistory[23] = min((int)(stepCount % 24), 24);
 
-    if (currentMode == MODE_ACTIVITY) uiDirty = true;
     if (currentMode == MODE_HOME) homeCornerDirty = true;
+    if (currentMode == MODE_ACTIVITY) activityDynamicDirty = true;
   }
 
   if (bufferReady) {
@@ -686,18 +747,16 @@ void loop() {
       String label = predictLabel(result, score);
 
       float shakeScore = getLabelScore(result, "shake");
-      float lrScore = getLabelScore(result, "left-right");
-      float udScore = getLabelScore(result, "up-down");
+      float lrScore    = getLabelScore(result, "left-right");
+      float udScore    = getLabelScore(result, "up-down");
 
       lastGesture = label;
       lastGestureScore = score;
-
       footerDirty = true;
+
       if (currentMode == MODE_HOME) {
         homeCornerDirty = true;
-        faceDirty = true;
-      } else {
-        uiDirty = true;
+        homeFaceDirty = true;
       }
 
       Serial.print("Pred: ");
@@ -721,19 +780,27 @@ void loop() {
       }
       Serial.println("-----");
 
-      if (shakeScore > SHAKE_TRIGGER_THRESHOLD &&
-          millis() - lastShakeTriggerMs > SHAKE_TRIGGER_COOLDOWN) {
+      bool canSwitch = millis() - lastModeSwitchMs >= MODE_SWITCH_COOLDOWN;
+      bool canShake  = millis() - lastShakeTriggerMs >= SHAKE_TRIGGER_COOLDOWN;
+
+      if (canShake &&
+          shakeScore > SHAKE_TRIGGER_THRESHOLD &&
+          shakeScore > lrScore + GESTURE_DOMINANCE_GAP &&
+          shakeScore > udScore + GESTURE_DOMINANCE_GAP) {
         triggerDizzy();
         Serial.println(">>> SHAKE TRIGGERED");
       }
-
-      if (millis() - lastModeSwitchMs >= MODE_SWITCH_COOLDOWN) {
-        if (lrScore > LR_TRIGGER_THRESHOLD && lrScore > udScore) {
-          switchToNextMode();
-        }
-        else if (udScore > UD_TRIGGER_THRESHOLD && udScore > lrScore) {
-          switchToPrevMode();
-        }
+      else if (canSwitch &&
+               lrScore > LR_TRIGGER_THRESHOLD &&
+               lrScore > udScore + GESTURE_DOMINANCE_GAP &&
+               lrScore > shakeScore + GESTURE_DOMINANCE_GAP) {
+        switchToNextMode();
+      }
+      else if (canSwitch &&
+               udScore > UD_TRIGGER_THRESHOLD &&
+               udScore > lrScore + GESTURE_DOMINANCE_GAP &&
+               udScore > shakeScore + GESTURE_DOMINANCE_GAP) {
+        switchToPrevMode();
       }
     } else {
       Serial.print("run_classifier error: ");
@@ -743,37 +810,23 @@ void loop() {
 
   if (dizzyActive && millis() > dizzyUntilMs) {
     dizzyActive = false;
-    faceDirty = true;
+    if (currentMode == MODE_HOME) homeFaceDirty = true;
   }
 
+  // 主页脸部动画局部刷新
   if (currentMode == MODE_HOME &&
-      (dizzyActive || faceDirty) &&
+      homeFaceDirty &&
       millis() - lastFaceAnimMs >= FACE_ANIM_INTERVAL_MS) {
     lastFaceAnimMs = millis();
     drawHomeFaceOnly();
-    faceDirty = false;
   }
 
-  if (footerDirty && millis() - lastUiMs >= UI_INTERVAL_MS) {
-    drawFooter();
-    footerDirty = false;
-  }
-
-  if (currentMode == MODE_HOME &&
-      homeCornerDirty &&
-      millis() - lastUiMs >= UI_INTERVAL_MS) {
-    drawHomeCornerWidgets();
-    homeCornerDirty = false;
-  }
-
+  // 统一低频刷新其他局部区域
   if (millis() - lastUiMs >= UI_INTERVAL_MS) {
     lastUiMs = millis();
-    if (uiDirty) {
-      renderUI();
-      uiDirty = false;
-      footerDirty = false;
-      homeCornerDirty = false;
-      faceDirty = false;
-    }
+
+    if (headerDirty) drawHeader();
+    if (footerDirty) drawFooter();
+    renderCurrentModeIfNeeded();
   }
 }
