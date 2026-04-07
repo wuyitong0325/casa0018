@@ -54,12 +54,13 @@ UIMode lastRenderedMode = MODE_COUNT;
 #define COL_PANEL2     COL_LINE
 
 // =====================================================
-// 模型与触发参数
+// 触发参数
 // =====================================================
 const float SHAKE_TRIGGER_THRESHOLD = 0.20f;
-const float LR_TRIGGER_THRESHOLD    = 0.35f;
-const float UD_TRIGGER_THRESHOLD    = 0.35f;
-const float GESTURE_DOMINANCE_GAP   = 0.10f;
+const float LR_TRIGGER_THRESHOLD    = 0.18f;
+const float UD_TRIGGER_THRESHOLD    = 0.55f;
+const float LR_FIX_MIN_SCORE        = 0.07f;
+const float AXIS_DOMINANCE_RATIO    = 1.25f;
 
 unsigned long lastModeSwitchMs = 0;
 const unsigned long MODE_SWITCH_COOLDOWN = 1200;
@@ -88,7 +89,15 @@ int lightHistory[LIGHT_HISTORY];
 int lightIndex = 0;
 String lightContext = "indoor";
 
-int soundBars[8] = {26, 35, 40, 48, 60, 45, 34, 24};
+// =====================================================
+// 真麦克风声音数据
+// =====================================================
+int soundBars[8] = {18, 20, 22, 25, 23, 21, 19, 18};
+float soundDb = 0.0f;              // 相对 dB
+float soundDbSmooth = 0.0f;
+int micDcEstimate = 2048;          // 用于估计麦克风中线
+const int MIC_SAMPLE_COUNT = 128;
+const int MIC_BAR_COUNT = 8;
 
 int stepHistory[24] = {
   2, 3, 5, 4, 6, 8, 7, 9,
@@ -102,10 +111,10 @@ int gestureHistory[24] = {
   49, 57, 60, 58, 62, 59, 64, 61
 };
 
-// =====================================================
-// shake 后处理增强
-// =====================================================
-float shakeAccum = 0.0f;
+// 最近一次采样的 IMU 值，用于方向判定
+float lastAx = 0.0f;
+float lastAy = 0.0f;
+float lastAz = 0.0f;
 
 // =====================================================
 // 局部刷新控制
@@ -144,37 +153,62 @@ static int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
 }
 
 // =====================================================
-// 声音条更新
+// 真麦克风采样 -> 更新 soundBars / soundDb
 // =====================================================
-void updateMockSoundBars() {
-  for (int i = 0; i < 8; i++) {
-    int delta = random(-10, 11);
-    soundBars[i] += delta;
-    if (soundBars[i] < 16) soundBars[i] = 16;
-    if (soundBars[i] > 78) soundBars[i] = 78;
+void updateRealSoundBars() {
+#ifdef WIO_MIC
+  const int samplesPerBar = MIC_SAMPLE_COUNT / MIC_BAR_COUNT;
+
+  long totalAbs = 0;
+  int localBars[MIC_BAR_COUNT];
+
+  // 先快速估计当前中线
+  long dcSum = 0;
+  for (int i = 0; i < 16; i++) {
+    dcSum += analogRead(WIO_MIC);
   }
-}
+  int dcNow = dcSum / 16;
+  micDcEstimate = (micDcEstimate * 7 + dcNow) / 8;
 
-// =====================================================
-// 标签辅助判断
-// 按常见命名都兼容一下，避免标签名不一致
-// =====================================================
-bool isShakeLabel(const String &label) {
-  return label == "shake";
-}
+  // 分段采样
+  for (int b = 0; b < MIC_BAR_COUNT; b++) {
+    long segAbs = 0;
 
-bool isLeftRightLabel(const String &label) {
-  return label == "left-right" ||
-         label == "leftright" ||
-         label == "left_right" ||
-         label == "leftRight";
-}
+    for (int i = 0; i < samplesPerBar; i++) {
+      int v = analogRead(WIO_MIC);
+      int diff = abs(v - micDcEstimate);
+      segAbs += diff;
+      totalAbs += diff;
+    }
 
-bool isUpDownLabel(const String &label) {
-  return label == "up-down" ||
-         label == "updown" ||
-         label == "up_down" ||
-         label == "upDown";
+    int avgSeg = segAbs / samplesPerBar;
+
+    // 把振幅映射成柱状图高度
+    int h = map(avgSeg, 2, 180, 14, 82);
+    h = constrain(h, 14, 82);
+
+    // 轻微平滑，减少乱跳
+    soundBars[b] = (soundBars[b] * 2 + h) / 3;
+    localBars[b] = soundBars[b];
+  }
+
+  float avgAbs = (float)totalAbs / MIC_SAMPLE_COUNT;
+
+  // 相对 dB，避免 log(0)
+  float db = 20.0f * log10f((avgAbs + 1.0f) / 8.0f) + 42.0f;
+
+  if (db < 0.0f) db = 0.0f;
+  if (db > 99.9f) db = 99.9f;
+
+  soundDbSmooth = soundDbSmooth * 0.75f + db * 0.25f;
+  soundDb = soundDbSmooth;
+#else
+  // 如果编译环境没有 WIO_MIC，保底不报错
+  for (int i = 0; i < 8; i++) {
+    soundBars[i] = 18;
+  }
+  soundDb = 0.0f;
+#endif
 }
 
 // =====================================================
@@ -378,6 +412,10 @@ void sampleIMUToBuffer() {
   float ay = lis.getAccelerationY();
   float az = lis.getAccelerationZ();
 
+  lastAx = ax;
+  lastAy = ay;
+  lastAz = az;
+
   maybeCountStep(ax, ay, az);
 
   if (imuBufferIx + 3 <= EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
@@ -534,21 +572,35 @@ void drawSoundStatic() {
   fillRoundPanel(16, 46, 288, 150, 18, COL_PANEL, COL_PINK2);
   tft.setTextColor(COL_SUBTEXT, COL_PANEL);
   tft.drawString("Sound Dashboard", 28, 56, 2);
-  tft.setTextColor(COL_PINK2, COL_PANEL);
-  tft.drawString("AUDIO", 220, 56, 2);
-  tft.setTextColor(COL_TEXT, COL_PANEL);
-  tft.drawString("Energy", 28, 86, 4);
+
+  // 小号 dB 标签区域
+  tft.fillRoundRect(232, 54, 58, 24, 8, COL_FACE_BG);
+  tft.drawRoundRect(232, 54, 58, 24, 8, COL_PINK2);
+  tft.setTextColor(COL_PINK2, COL_FACE_BG);
+  tft.drawCentreString("dB", 261, 61, 2);
 
   soundStaticDirty = false;
 }
 
 void drawSoundBarsOnly() {
-  int baseY = 178;
-  int startX = 36;
-  int barW = 22;
-  int gap = 10;
+  // 清理柱状图区域
+  tft.fillRect(28, 82, 260, 102, COL_PANEL);
 
-  tft.fillRect(30, 96, 250, 88, COL_PANEL);
+  // 网格线
+  for (int i = 0; i < 4; i++) {
+    int yy = 94 + i * 24;
+    tft.drawFastHLine(32, yy, 248, COL_LINE);
+  }
+
+  // 右上角数值，小一点，不遮挡
+  tft.fillRect(220, 82, 70, 26, COL_PANEL);
+  tft.setTextColor(COL_PINK2, COL_PANEL);
+  tft.drawRightString(String(soundDb, 1), 276, 86, 4);
+
+  int baseY = 178;
+  int startX = 40;
+  int barW = 20;
+  int gap = 10;
 
   for (int i = 0; i < 8; i++) {
     int h = soundBars[i];
@@ -557,7 +609,10 @@ void drawSoundBarsOnly() {
 
     tft.fillRoundRect(x, y, barW, h, 6, COL_PINK2);
     tft.drawRoundRect(x, y, barW, h, 6, COL_PINK2);
-    tft.drawFastVLine(x + 4, y + 4, max(0, h - 8), TFT_WHITE);
+
+    if (h > 10) {
+      tft.drawFastVLine(x + 4, y + 4, h - 8, TFT_WHITE);
+    }
   }
 
   soundBarsDirty = false;
@@ -694,6 +749,12 @@ void setup() {
 
   randomSeed(analogRead(A0));
 
+  analogReadResolution(12);
+
+#ifdef WIO_MIC
+  pinMode(WIO_MIC, INPUT);
+#endif
+
   for (int i = 0; i < LIGHT_HISTORY; i++) {
     lightHistory[i] = 0;
   }
@@ -731,11 +792,18 @@ void loop() {
     if (lightContext != oldContext) footerDirty = true;
   }
 
+  // 真麦克风更新
   static unsigned long lastSoundAnimMs = 0;
-  if (millis() - lastSoundAnimMs >= 220) {
+  if (millis() - lastSoundAnimMs >= 80) {
     lastSoundAnimMs = millis();
-    updateMockSoundBars();
-    if (currentMode == MODE_SOUND) soundBarsDirty = true;
+    updateRealSoundBars();
+
+    if (currentMode == MODE_SOUND) {
+      soundBarsDirty = true;
+    }
+
+    Serial.print("Mic dB=");
+    Serial.println(soundDb, 1);
   }
 
   static unsigned long lastStepHistMs = 0;
@@ -767,13 +835,6 @@ void loop() {
       float lrScore    = getLabelScore(result, "left-right");
       float udScore    = getLabelScore(result, "up-down");
 
-      if (shakeScore > 0.18f) {
-        shakeAccum += shakeScore;
-        if (shakeAccum > 1.2f) shakeAccum = 1.2f;
-      } else {
-        shakeAccum *= 0.65f;
-      }
-
       lastGesture = label;
       lastGestureScore = score;
       footerDirty = true;
@@ -782,6 +843,11 @@ void loop() {
         homeCornerDirty = true;
         homeFaceDirty = true;
       }
+
+      float absAx = fabs(lastAx);
+      float absAy = fabs(lastAy);
+      bool axisSuggestLR = absAx > absAy * AXIS_DOMINANCE_RATIO;
+      bool axisSuggestUD = absAy > absAx * AXIS_DOMINANCE_RATIO;
 
       Serial.print("Pred: ");
       Serial.print(label);
@@ -793,9 +859,20 @@ void loop() {
       Serial.print(" lr=");
       Serial.print(lrScore, 3);
       Serial.print(" ud=");
-      Serial.print(udScore, 3);
-      Serial.print(" accum=");
-      Serial.println(shakeAccum, 3);
+      Serial.println(udScore, 3);
+
+      Serial.print("ax=");
+      Serial.print(lastAx, 3);
+      Serial.print(" ay=");
+      Serial.print(lastAy, 3);
+      Serial.print(" absAx=");
+      Serial.print(absAx, 3);
+      Serial.print(" absAy=");
+      Serial.print(absAy, 3);
+      Serial.print(" axis=");
+      if (axisSuggestLR) Serial.println("LR");
+      else if (axisSuggestUD) Serial.println("UD");
+      else Serial.println("UNCLEAR");
 
       for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
         Serial.print(result.classification[i].label);
@@ -807,31 +884,23 @@ void loop() {
       bool canSwitch = millis() - lastModeSwitchMs >= MODE_SWITCH_COOLDOWN;
       bool canShake  = millis() - lastShakeTriggerMs >= SHAKE_TRIGGER_COOLDOWN;
 
-      // 1) shake 优先，且当 shake 证据明显时不允许翻页
-      bool shakeLikely = (shakeAccum > 0.55f || isShakeLabel(label));
-
-      if (canShake &&
-          shakeAccum > 0.75f &&
-          shakeScore > SHAKE_TRIGGER_THRESHOLD &&
-          shakeScore > lrScore - 0.03f &&
-          shakeScore > udScore - 0.03f) {
+      if (canShake && shakeScore > SHAKE_TRIGGER_THRESHOLD) {
         triggerDizzy();
-        shakeAccum = 0.0f;
         Serial.println(">>> SHAKE TRIGGERED");
       }
-      // 2) 只有 label 明确就是 left-right，才翻到下一页
-      else if (canSwitch &&
-               !shakeLikely &&
-               isLeftRightLabel(label) &&
-               score > LR_TRIGGER_THRESHOLD) {
+      else if (canSwitch && lrScore > LR_TRIGGER_THRESHOLD) {
         switchToNextMode();
+        Serial.println(">>> LEFT-RIGHT TRIGGERED (model direct)");
       }
-      // 3) 只有 label 明确就是 up-down，才返回上一页
-      else if (canSwitch &&
-               !shakeLikely &&
-               isUpDownLabel(label) &&
-               score > UD_TRIGGER_THRESHOLD) {
-        switchToPrevMode();
+      else if (canSwitch && udScore > UD_TRIGGER_THRESHOLD) {
+        if (axisSuggestLR && lrScore > LR_FIX_MIN_SCORE) {
+          switchToNextMode();
+          Serial.println(">>> LEFT-RIGHT TRIGGERED (fix from up-down)");
+        }
+        else {
+          switchToPrevMode();
+          Serial.println(">>> UP-DOWN TRIGGERED");
+        }
       }
     } else {
       Serial.print("run_classifier error: ");
