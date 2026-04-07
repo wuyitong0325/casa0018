@@ -26,12 +26,26 @@ enum UIMode {
   MODE_HOME = 0,
   MODE_SOUND,
   MODE_LIGHT,
-  MODE_ACTIVITY,
+  MODE_STATUS,
   MODE_COUNT
 };
 
 UIMode currentMode = MODE_HOME;
 UIMode lastRenderedMode = MODE_COUNT;
+
+// =====================================================
+// STATUS 页面状态枚举
+// =====================================================
+enum DeviceStatus {
+  STATUS_FOCUS = 0,
+  STATUS_REST,
+  STATUS_SPEECH,
+  STATUS_NOISE
+};
+
+DeviceStatus currentStatus = STATUS_FOCUS;
+DeviceStatus lastStatus = STATUS_FOCUS;
+float currentStatusConfidence = 0.0f;
 
 // =====================================================
 // 颜色
@@ -53,8 +67,13 @@ UIMode lastRenderedMode = MODE_COUNT;
 #define COL_FACE_BG    0xFFF9
 #define COL_PANEL2     COL_LINE
 
+#define COL_STATUS_FOCUS   COL_GREEN2
+#define COL_STATUS_REST    COL_CYAN2
+#define COL_STATUS_SPEECH  COL_ORANGE2
+#define COL_STATUS_NOISE   COL_RED2
+
 // =====================================================
-// 触发参数
+// 手势触发参数
 // =====================================================
 const float SHAKE_TRIGGER_THRESHOLD = 0.20f;
 const float LR_TRIGGER_THRESHOLD    = 0.18f;
@@ -77,12 +96,10 @@ float lastGestureScore = 0.0f;
 bool dizzyActive = false;
 unsigned long dizzyUntilMs = 0;
 
-uint32_t stepCount = 0;
-unsigned long lastStepMs = 0;
-const unsigned long STEP_DEBOUNCE_MS = 350;
-
 int mockTempC = 12;
-const char* mockWeather = "Cloudy";
+
+// 亮度阈值：小于此值视为偏暗
+const int LIGHT_REST_THRESHOLD = 400;
 
 static const int LIGHT_HISTORY = 80;
 int lightHistory[LIGHT_HISTORY];
@@ -93,16 +110,17 @@ String lightContext = "indoor";
 // 真麦克风声音数据
 // =====================================================
 int soundBars[8] = {18, 20, 22, 25, 23, 21, 19, 18};
-float soundDb = 0.0f;              // 相对 dB
+float soundDb = 0.0f;
 float soundDbSmooth = 0.0f;
-int micDcEstimate = 2048;          // 用于估计麦克风中线
+int micDcEstimate = 2048;
 const int MIC_SAMPLE_COUNT = 128;
 const int MIC_BAR_COUNT = 8;
 
-int stepHistory[24] = {
-  2, 3, 5, 4, 6, 8, 7, 9,
-  10, 12, 11, 13, 12, 15, 16, 14,
-  13, 17, 18, 16, 15, 19, 20, 18
+// STATUS 历史
+int statusHistory[24] = {
+  35, 36, 38, 40, 42, 44, 41, 39,
+  36, 34, 32, 30, 33, 37, 43, 47,
+  52, 58, 61, 56, 49, 45, 40, 38
 };
 
 int gestureHistory[24] = {
@@ -111,7 +129,7 @@ int gestureHistory[24] = {
   49, 57, 60, 58, 62, 59, 64, 61
 };
 
-// 最近一次采样的 IMU 值，用于方向判定
+// 最近一次采样的 IMU 值，仅用于手势方向判定
 float lastAx = 0.0f;
 float lastAy = 0.0f;
 float lastAz = 0.0f;
@@ -128,8 +146,8 @@ bool soundStaticDirty = true;
 bool soundBarsDirty = true;
 bool lightStaticDirty = true;
 bool lightGraphDirty = true;
-bool activityStaticDirty = true;
-bool activityDynamicDirty = true;
+bool statusStaticDirty = true;
+bool statusDynamicDirty = true;
 
 unsigned long lastUiMs = 0;
 const unsigned long UI_INTERVAL_MS = 120;
@@ -153,84 +171,55 @@ static int raw_feature_get_data(size_t offset, size_t length, float *out_ptr) {
 }
 
 // =====================================================
-// 真麦克风采样 -> 更新 soundBars / soundDb
-// =====================================================
-void updateRealSoundBars() {
-#ifdef WIO_MIC
-  const int samplesPerBar = MIC_SAMPLE_COUNT / MIC_BAR_COUNT;
-
-  long totalAbs = 0;
-  int localBars[MIC_BAR_COUNT];
-
-  // 先快速估计当前中线
-  long dcSum = 0;
-  for (int i = 0; i < 16; i++) {
-    dcSum += analogRead(WIO_MIC);
-  }
-  int dcNow = dcSum / 16;
-  micDcEstimate = (micDcEstimate * 7 + dcNow) / 8;
-
-  // 分段采样
-  for (int b = 0; b < MIC_BAR_COUNT; b++) {
-    long segAbs = 0;
-
-    for (int i = 0; i < samplesPerBar; i++) {
-      int v = analogRead(WIO_MIC);
-      int diff = abs(v - micDcEstimate);
-      segAbs += diff;
-      totalAbs += diff;
-    }
-
-    int avgSeg = segAbs / samplesPerBar;
-
-    // 把振幅映射成柱状图高度
-    int h = map(avgSeg, 2, 180, 14, 82);
-    h = constrain(h, 14, 82);
-
-    // 轻微平滑，减少乱跳
-    soundBars[b] = (soundBars[b] * 2 + h) / 3;
-    localBars[b] = soundBars[b];
-  }
-
-  float avgAbs = (float)totalAbs / MIC_SAMPLE_COUNT;
-
-  // 相对 dB，避免 log(0)
-  float db = 20.0f * log10f((avgAbs + 1.0f) / 8.0f) + 42.0f;
-
-  if (db < 0.0f) db = 0.0f;
-  if (db > 99.9f) db = 99.9f;
-
-  soundDbSmooth = soundDbSmooth * 0.75f + db * 0.25f;
-  soundDb = soundDbSmooth;
-#else
-  // 如果编译环境没有 WIO_MIC，保底不报错
-  for (int i = 0; i < 8; i++) {
-    soundBars[i] = 18;
-  }
-  soundDb = 0.0f;
-#endif
-}
-
-// =====================================================
 // 工具函数
 // =====================================================
+const char* statusName(DeviceStatus s) {
+  switch (s) {
+    case STATUS_FOCUS:  return "FOCUS";
+    case STATUS_REST:   return "REST";
+    case STATUS_SPEECH: return "SPEECH";
+    case STATUS_NOISE:  return "NOISE";
+    default:            return "?";
+  }
+}
+
+uint16_t statusColor(DeviceStatus s) {
+  switch (s) {
+    case STATUS_FOCUS:  return COL_STATUS_FOCUS;
+    case STATUS_REST:   return COL_STATUS_REST;
+    case STATUS_SPEECH: return COL_STATUS_SPEECH;
+    case STATUS_NOISE:  return COL_STATUS_NOISE;
+    default:            return COL_ACCENT;
+  }
+}
+
 const char* modeName(UIMode m) {
   switch (m) {
-    case MODE_HOME: return "HOME";
-    case MODE_SOUND: return "SOUND";
-    case MODE_LIGHT: return "LIGHT";
-    case MODE_ACTIVITY: return "STEP";
-    default: return "?";
+    case MODE_HOME:   return "HOME";
+    case MODE_SOUND:  return "SOUND";
+    case MODE_LIGHT:  return "LIGHT";
+    case MODE_STATUS: return "STATUS";
+    default:          return "?";
   }
 }
 
 uint16_t accentColorForMode(UIMode m) {
   switch (m) {
-    case MODE_HOME: return COL_ACCENT;
-    case MODE_SOUND: return COL_PINK2;
-    case MODE_LIGHT: return COL_CYAN2;
-    case MODE_ACTIVITY: return COL_GREEN2;
-    default: return COL_ACCENT;
+    case MODE_HOME:   return COL_ACCENT;
+    case MODE_SOUND:  return COL_PINK2;
+    case MODE_LIGHT:  return COL_CYAN2;
+    case MODE_STATUS: return statusColor(currentStatus);
+    default:          return COL_ACCENT;
+  }
+}
+
+int statusScore(DeviceStatus s) {
+  switch (s) {
+    case STATUS_REST:   return 20;
+    case STATUS_FOCUS:  return 40;
+    case STATUS_SPEECH: return 70;
+    case STATUS_NOISE:  return 95;
+    default:            return 50;
   }
 }
 
@@ -267,17 +256,6 @@ void pushLightSample(int rawLight) {
   lightIndex = (lightIndex + 1) % LIGHT_HISTORY;
 }
 
-void maybeCountStep(float ax, float ay, float az) {
-  float mag = sqrt(ax * ax + ay * ay + az * az);
-  if (mag > 14.0f && millis() - lastStepMs > STEP_DEBOUNCE_MS) {
-    stepCount++;
-    lastStepMs = millis();
-    footerDirty = true;
-    if (currentMode == MODE_HOME) homeCornerDirty = true;
-    if (currentMode == MODE_ACTIVITY) activityDynamicDirty = true;
-  }
-}
-
 void triggerDizzy() {
   dizzyActive = true;
   dizzyUntilMs = millis() + 1500;
@@ -299,9 +277,9 @@ void markAllDirtyForMode(UIMode m) {
   } else if (m == MODE_LIGHT) {
     lightStaticDirty = true;
     lightGraphDirty = true;
-  } else if (m == MODE_ACTIVITY) {
-    activityStaticDirty = true;
-    activityDynamicDirty = true;
+  } else if (m == MODE_STATUS) {
+    statusStaticDirty = true;
+    statusDynamicDirty = true;
   }
 }
 
@@ -359,38 +337,133 @@ void drawMiniLineChart(int x, int y, int w, int h, int *data, int len, int minV,
   }
 }
 
-void drawGauge(int cx, int cy, int r, float value01, uint16_t arcColor, const char* label, uint16_t bg) {
-  value01 = constrain(value01, 0.0f, 1.0f);
+void drawStatusFace(int cx, int cy, int r, DeviceStatus s, uint16_t faceColor, uint16_t bgColor) {
+  tft.fillCircle(cx, cy, r, faceColor);
+  tft.drawCircle(cx, cy, r, TFT_BLACK);
+  tft.drawCircle(cx, cy, r + 1, TFT_BLACK);
 
-  for (int a = -140; a <= 140; a += 4) {
-    float rad = a * 0.0174533f;
-    int x0 = cx + cos(rad) * (r - 8);
-    int y0 = cy + sin(rad) * (r - 8);
-    int x1 = cx + cos(rad) * r;
-    int y1 = cy + sin(rad) * r;
-    tft.drawLine(x0, y0, x1, y1, COL_LINE);
+  if (s == STATUS_FOCUS) {
+    tft.fillCircle(cx - 12, cy - 8, 4, TFT_BLACK);
+    tft.fillCircle(cx + 12, cy - 8, 4, TFT_BLACK);
+    tft.drawFastHLine(cx - 10, cy + 12, 20, TFT_BLACK);
+    tft.drawFastHLine(cx - 8, cy + 13, 16, TFT_BLACK);
+  }
+  else if (s == STATUS_REST) {
+    tft.drawFastHLine(cx - 16, cy - 8, 10, TFT_BLACK);
+    tft.drawFastHLine(cx + 6, cy - 8, 10, TFT_BLACK);
+    tft.drawFastHLine(cx - 8, cy + 12, 16, TFT_BLACK);
+    tft.setTextColor(TFT_BLACK, bgColor);
+    tft.drawString("z", cx + 18, cy - 22, 2);
+    tft.drawString("z", cx + 28, cy - 32, 1);
+  }
+  else if (s == STATUS_SPEECH) {
+    tft.fillCircle(cx - 12, cy - 8, 4, TFT_BLACK);
+    tft.fillCircle(cx + 12, cy - 8, 4, TFT_BLACK);
+    tft.drawCircle(cx, cy + 12, 6, TFT_BLACK);
+    tft.drawCircle(cx, cy + 12, 5, TFT_BLACK);
+  }
+  else if (s == STATUS_NOISE) {
+    tft.drawLine(cx - 16, cy - 12, cx - 8, cy - 4, TFT_BLACK);
+    tft.drawLine(cx - 16, cy - 4, cx - 8, cy - 12, TFT_BLACK);
+    tft.drawLine(cx + 8, cy - 12, cx + 16, cy - 4, TFT_BLACK);
+    tft.drawLine(cx + 8, cy - 4, cx + 16, cy - 12, TFT_BLACK);
+    tft.drawFastHLine(cx - 12, cy + 14, 24, TFT_BLACK);
+    tft.drawFastHLine(cx - 10, cy + 15, 20, TFT_BLACK);
+  }
+}
+
+// =====================================================
+// 状态融合逻辑：只看声音 + 亮度
+// 规则：
+// < 50        -> REST / FOCUS（由亮度决定）
+// 50 ~ 75     -> SPEECH
+// > 75        -> NOISE
+// =====================================================
+void updateStatusFromSensors() {
+  int latestLight = lightHistory[(lightIndex - 1 + LIGHT_HISTORY) % LIGHT_HISTORY];
+
+  lastStatus = currentStatus;
+
+  if (soundDb > 75.0f) {
+    currentStatus = STATUS_NOISE;
+    currentStatusConfidence = min(1.0f, 0.75f + (soundDb - 75.0f) / 20.0f);
+  }
+  else if (soundDb >= 50.0f) {
+    currentStatus = STATUS_SPEECH;
+    currentStatusConfidence = 0.82f;
+  }
+  else {
+    if (latestLight < LIGHT_REST_THRESHOLD) {
+      currentStatus = STATUS_REST;
+      currentStatusConfidence = 0.86f;
+    } else {
+      currentStatus = STATUS_FOCUS;
+      currentStatusConfidence = 0.84f;
+    }
   }
 
-  int endAngle = -140 + (int)(280.0f * value01);
-  for (int a = -140; a <= endAngle; a += 4) {
-    float rad = a * 0.0174533f;
-    int x0 = cx + cos(rad) * (r - 8);
-    int y0 = cy + sin(rad) * (r - 8);
-    int x1 = cx + cos(rad) * r;
-    int y1 = cy + sin(rad) * r;
-    tft.drawLine(x0, y0, x1, y1, arcColor);
-    tft.drawLine(x0, y0 - 1, x1, y1 - 1, arcColor);
+  if (currentStatus != lastStatus) {
+    headerDirty = true;
+    footerDirty = true;
+
+    if (currentMode == MODE_STATUS) {
+      statusStaticDirty = true;
+      statusDynamicDirty = true;
+    }
+
+    if (currentMode == MODE_HOME) {
+      homeCornerDirty = true;
+    }
+  }
+}
+
+// =====================================================
+// 真麦克风采样
+// =====================================================
+void updateRealSoundBars() {
+#ifdef WIO_MIC
+  const int samplesPerBar = MIC_SAMPLE_COUNT / MIC_BAR_COUNT;
+
+  long totalAbs = 0;
+
+  long dcSum = 0;
+  for (int i = 0; i < 16; i++) {
+    dcSum += analogRead(WIO_MIC);
+  }
+  int dcNow = dcSum / 16;
+  micDcEstimate = (micDcEstimate * 7 + dcNow) / 8;
+
+  for (int b = 0; b < MIC_BAR_COUNT; b++) {
+    long segAbs = 0;
+
+    for (int i = 0; i < samplesPerBar; i++) {
+      int v = analogRead(WIO_MIC);
+      int diff = abs(v - micDcEstimate);
+      segAbs += diff;
+      totalAbs += diff;
+    }
+
+    int avgSeg = segAbs / samplesPerBar;
+    int h = map(avgSeg, 2, 180, 14, 82);
+    h = constrain(h, 14, 82);
+
+    soundBars[b] = (soundBars[b] * 2 + h) / 3;
   }
 
-  float needleA = (-140 + 280.0f * value01) * 0.0174533f;
-  int nx = cx + cos(needleA) * (r - 14);
-  int ny = cy + sin(needleA) * (r - 14);
-  tft.drawLine(cx, cy, nx, ny, arcColor);
-  tft.drawLine(cx + 1, cy, nx + 1, ny, arcColor);
-  tft.fillCircle(cx, cy, 3, arcColor);
+  float avgAbs = (float)totalAbs / MIC_SAMPLE_COUNT;
+  float db = 20.0f * log10f((avgAbs + 1.0f) / 8.0f) + 42.0f;
 
-  tft.setTextColor(COL_TEXT, bg);
-  tft.drawCentreString(label, cx, cy + 8, 2);
+  if (db < 0.0f) db = 0.0f;
+  if (db > 99.9f) db = 99.9f;
+
+  soundDbSmooth = soundDbSmooth * 0.75f + db * 0.25f;
+  soundDb = soundDbSmooth;
+#else
+  for (int i = 0; i < 8; i++) {
+    soundBars[i] = 18;
+  }
+  soundDb = 0.0f;
+#endif
 }
 
 // =====================================================
@@ -415,8 +488,6 @@ void sampleIMUToBuffer() {
   lastAx = ax;
   lastAy = ay;
   lastAz = az;
-
-  maybeCountStep(ax, ay, az);
 
   if (imuBufferIx + 3 <= EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE) {
     imuBuffer[imuBufferIx++] = ax;
@@ -461,10 +532,16 @@ void drawFooter() {
   tft.drawRoundRect(10, 206, 300, 24, 10, COL_PANEL2);
 
   tft.setTextColor(TFT_DARKGREY, COL_PANEL_ALT);
-  tft.drawString("Steps " + String(stepCount), 20, 212, 2);
 
-  tft.setTextColor(accentColorForMode(currentMode), COL_PANEL_ALT);
-  tft.drawRightString(lastGesture + " " + String(lastGestureScore, 2), 295, 212, 2);
+  if (currentMode == MODE_STATUS) {
+    tft.drawString(String(soundDb, 1) + " dB", 20, 212, 2);
+    tft.setTextColor(statusColor(currentStatus), COL_PANEL_ALT);
+    tft.drawRightString(String(statusName(currentStatus)) + " " + String((int)(currentStatusConfidence * 100)) + "%", 295, 212, 2);
+  } else {
+    tft.drawString("Light " + lightContext, 20, 212, 2);
+    tft.setTextColor(accentColorForMode(currentMode), COL_PANEL_ALT);
+    tft.drawRightString(lastGesture + " " + String(lastGestureScore, 2), 295, 212, 2);
+  }
 
   footerDirty = false;
 }
@@ -481,7 +558,7 @@ void drawHomeStatic() {
   drawMiniCard(16, 46, 92, 52, "Light", COL_CYAN2);
   drawMiniCard(212, 46, 92, 52, "Score", COL_PINK2);
   drawMiniCard(16, 144, 92, 52, "Trend", COL_CYAN2);
-  drawMiniCard(212, 144, 92, 52, "Motion", COL_GREEN2);
+  drawMiniCard(212, 144, 92, 52, "Status", statusColor(currentStatus));
 
   fillRoundPanel(112, 52, 96, 144, 18, COL_FACE_BG, COL_ACCENT);
 
@@ -509,9 +586,13 @@ void drawHomeCornerWidgets() {
   tft.fillRect(18, 150, 88, 40, COL_PANEL);
   drawMiniLineChart(16, 144, 92, 52, gestureHistory, 24, 0, 100, COL_CYAN2);
 
+  uint16_t sc = statusColor(currentStatus);
   tft.fillRoundRect(212, 144, 92, 52, 10, COL_PANEL);
-  tft.drawRoundRect(212, 144, 92, 52, 10, COL_GREEN2);
-  drawGauge(258, 173, 18, min(stepCount % 100, 100U) / 100.0f, COL_GREEN2, "step", COL_PANEL);
+  tft.drawRoundRect(212, 144, 92, 52, 10, sc);
+  tft.setTextColor(sc, COL_PANEL);
+  tft.drawCentreString(statusName(currentStatus), 258, 156, 2);
+  tft.setTextColor(COL_SUBTEXT, COL_PANEL);
+  tft.drawCentreString(String((int)(currentStatusConfidence * 100)) + "%", 258, 175, 2);
 
   homeCornerDirty = false;
 }
@@ -540,7 +621,6 @@ void drawHomeFaceOnly() {
       tft.drawCircle(cx - 10, cy - 7, r, TFT_BLACK);
       tft.drawCircle(cx + 10, cy - 7, r, TFT_BLACK);
     }
-
     tft.drawFastHLine(cx - 14, cy + 12, 28, COL_RED2);
     tft.drawFastHLine(cx - 14, cy + 13, 28, COL_RED2);
     tft.drawFastHLine(cx - 14, cy + 14, 28, COL_RED2);
@@ -573,7 +653,6 @@ void drawSoundStatic() {
   tft.setTextColor(COL_SUBTEXT, COL_PANEL);
   tft.drawString("Sound Dashboard", 28, 56, 2);
 
-  // 小号 dB 标签区域
   tft.fillRoundRect(232, 54, 58, 24, 8, COL_FACE_BG);
   tft.drawRoundRect(232, 54, 58, 24, 8, COL_PINK2);
   tft.setTextColor(COL_PINK2, COL_FACE_BG);
@@ -583,16 +662,13 @@ void drawSoundStatic() {
 }
 
 void drawSoundBarsOnly() {
-  // 清理柱状图区域
   tft.fillRect(28, 82, 260, 102, COL_PANEL);
 
-  // 网格线
   for (int i = 0; i < 4; i++) {
     int yy = 94 + i * 24;
     tft.drawFastHLine(32, yy, 248, COL_LINE);
   }
 
-  // 右上角数值，小一点，不遮挡
   tft.fillRect(220, 82, 70, 26, COL_PANEL);
   tft.setTextColor(COL_PINK2, COL_PANEL);
   tft.drawRightString(String(soundDb, 1), 276, 86, 4);
@@ -669,41 +745,58 @@ void drawLightDynamicOnly() {
 }
 
 // =====================================================
-// STEP 页面
+// STATUS 页面
 // =====================================================
-void drawActivityStatic() {
-  if (lastRenderedMode != MODE_ACTIVITY) {
+void drawStatusStatic() {
+  if (lastRenderedMode != MODE_STATUS) {
     tft.fillScreen(COL_BG);
-    lastRenderedMode = MODE_ACTIVITY;
+    lastRenderedMode = MODE_STATUS;
   }
 
-  fillRoundPanel(16, 46, 136, 150, 18, COL_PANEL, COL_GREEN2);
-  fillRoundPanel(168, 46, 136, 150, 18, COL_PANEL, COL_GREEN2);
+  uint16_t sc = statusColor(currentStatus);
+
+  fillRoundPanel(16, 46, 136, 150, 18, COL_PANEL, sc);
+  fillRoundPanel(168, 46, 136, 150, 18, COL_FACE_BG, sc);
 
   tft.setTextColor(COL_SUBTEXT, COL_PANEL);
-  tft.drawString("Steps", 28, 56, 2);
-  tft.drawString("Gauge", 180, 56, 2);
+  tft.drawString("Status", 28, 56, 2);
 
-  activityStaticDirty = false;
+  tft.setTextColor(COL_SUBTEXT, COL_FACE_BG);
+  tft.drawString("Mood", 180, 56, 2);
+
+  statusStaticDirty = false;
 }
 
-void drawActivityDynamicOnly() {
+void drawStatusDynamicOnly() {
+  uint16_t sc = statusColor(currentStatus);
+
   tft.fillRect(22, 76, 124, 108, COL_PANEL);
 
-  tft.setTextColor(COL_GREEN2, COL_PANEL);
-  tft.drawCentreString(String(stepCount), 84, 92, 6);
-  drawMiniLineChart(24, 132, 120, 52, stepHistory, 24, 0, 24, COL_GREEN2);
+  tft.setTextColor(sc, COL_PANEL);
+  tft.drawCentreString(statusName(currentStatus), 84, 82, 4);
+
+  tft.setTextColor(COL_TEXT, COL_PANEL);
+  if (currentStatus == STATUS_FOCUS) {
+    tft.drawCentreString("focused", 84, 118, 2);
+  } else if (currentStatus == STATUS_REST) {
+    tft.drawCentreString("resting", 84, 118, 2);
+  } else if (currentStatus == STATUS_SPEECH) {
+    tft.drawCentreString("speaking", 84, 118, 2);
+  } else {
+    tft.drawCentreString("noisy", 84, 118, 2);
+  }
+
+  tft.setTextColor(COL_SUBTEXT, COL_PANEL);
+  tft.drawCentreString(String(soundDb, 1) + " dB", 84, 145, 2);
+  tft.drawCentreString(lightContext, 84, 164, 2);
 
   tft.fillRoundRect(176, 76, 120, 104, 12, COL_FACE_BG);
-  tft.drawRoundRect(176, 76, 120, 104, 12, COL_GREEN2);
+  tft.drawRoundRect(176, 76, 120, 104, 12, sc);
+  drawStatusFace(236, 124, 30, currentStatus, sc, COL_FACE_BG);
 
-  float ratio = min(stepCount % 100, 100U) / 100.0f;
-  drawGauge(236, 124, 34, ratio, COL_GREEN2, "walk", COL_FACE_BG);
+  drawMiniLineChart(16, 144, 136, 52, statusHistory, 24, 0, 100, sc);
 
-  tft.setTextColor(COL_GREEN2, COL_FACE_BG);
-  tft.drawCentreString(String((int)(ratio * 100)), 236, 156, 2);
-
-  activityDynamicDirty = false;
+  statusDynamicDirty = false;
 }
 
 // =====================================================
@@ -723,9 +816,9 @@ void renderCurrentModeIfNeeded() {
     if (lightStaticDirty) drawLightStatic();
     if (lightGraphDirty) drawLightDynamicOnly();
   }
-  else if (currentMode == MODE_ACTIVITY) {
-    if (activityStaticDirty) drawActivityStatic();
-    if (activityDynamicDirty) drawActivityDynamicOnly();
+  else if (currentMode == MODE_STATUS) {
+    if (statusStaticDirty) drawStatusStatic();
+    if (statusDynamicDirty) drawStatusDynamicOnly();
   }
 }
 
@@ -750,7 +843,6 @@ void setup() {
   randomSeed(analogRead(A0));
 
   analogReadResolution(12);
-
 #ifdef WIO_MIC
   pinMode(WIO_MIC, INPUT);
 #endif
@@ -789,34 +881,58 @@ void loop() {
 
     if (currentMode == MODE_HOME) homeCornerDirty = true;
     if (currentMode == MODE_LIGHT) lightGraphDirty = true;
-    if (lightContext != oldContext) footerDirty = true;
+
+    if (lightContext != oldContext) {
+      footerDirty = true;
+      updateStatusFromSensors();
+
+      if (currentMode == MODE_STATUS) {
+        statusStaticDirty = true;
+        statusDynamicDirty = true;
+      }
+    }
   }
 
-  // 真麦克风更新
   static unsigned long lastSoundAnimMs = 0;
   if (millis() - lastSoundAnimMs >= 80) {
     lastSoundAnimMs = millis();
+
     updateRealSoundBars();
+    updateStatusFromSensors();
 
     if (currentMode == MODE_SOUND) {
       soundBarsDirty = true;
     }
+    if (currentMode == MODE_STATUS) {
+      statusDynamicDirty = true;
+    }
+    if (currentMode == MODE_HOME) {
+      homeCornerDirty = true;
+    }
+
+    footerDirty = true;
 
     Serial.print("Mic dB=");
-    Serial.println(soundDb, 1);
+    Serial.print(soundDb, 1);
+    Serial.print(" status=");
+    Serial.println(statusName(currentStatus));
   }
 
-  static unsigned long lastStepHistMs = 0;
-  if (millis() - lastStepHistMs >= 700) {
-    lastStepHistMs = millis();
+  static unsigned long lastStatusHistMs = 0;
+  if (millis() - lastStatusHistMs >= 700) {
+    lastStatusHistMs = millis();
 
-    for (int i = 0; i < 23; i++) stepHistory[i] = stepHistory[i + 1];
-    stepHistory[23] = min((int)(stepCount % 24), 24);
+    for (int i = 0; i < 23; i++) statusHistory[i] = statusHistory[i + 1];
+    statusHistory[23] = statusScore(currentStatus);
 
-    if (currentMode == MODE_HOME) homeCornerDirty = true;
-    if (currentMode == MODE_ACTIVITY) activityDynamicDirty = true;
+    if (currentMode == MODE_STATUS) {
+      statusDynamicDirty = true;
+    }
   }
 
+  // =================================================
+  // 手势模型
+  // =================================================
   if (bufferReady) {
     bufferReady = false;
 
@@ -860,26 +976,6 @@ void loop() {
       Serial.print(lrScore, 3);
       Serial.print(" ud=");
       Serial.println(udScore, 3);
-
-      Serial.print("ax=");
-      Serial.print(lastAx, 3);
-      Serial.print(" ay=");
-      Serial.print(lastAy, 3);
-      Serial.print(" absAx=");
-      Serial.print(absAx, 3);
-      Serial.print(" absAy=");
-      Serial.print(absAy, 3);
-      Serial.print(" axis=");
-      if (axisSuggestLR) Serial.println("LR");
-      else if (axisSuggestUD) Serial.println("UD");
-      else Serial.println("UNCLEAR");
-
-      for (size_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-        Serial.print(result.classification[i].label);
-        Serial.print(": ");
-        Serial.println(result.classification[i].value, 3);
-      }
-      Serial.println("-----");
 
       bool canSwitch = millis() - lastModeSwitchMs >= MODE_SWITCH_COOLDOWN;
       bool canShake  = millis() - lastShakeTriggerMs >= SHAKE_TRIGGER_COOLDOWN;
